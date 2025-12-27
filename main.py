@@ -5,14 +5,15 @@ Scans Daft.ie for available rooms in Dublin and sends email notifications.
 
 import os
 import smtplib
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Set, List
+from typing import Set, List, Dict, Optional
 import logging
-
-from daftlistings import Daft, Location, SearchType, PropertyType
+import requests
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +30,9 @@ EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 SMTP_SERVER = "smtp-mail.outlook.com"
 SMTP_PORT = 587
+
+# Daft.ie search URL for sharing in Dublin
+DAFT_SEARCH_URL = "https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from={min_price}&rentalPrice_to={max_price}&propertyType=share"
 
 
 def load_seen_listings() -> Set[str]:
@@ -53,7 +57,7 @@ def save_listing_id(listing_id: str) -> None:
     logger.info(f"Saved listing ID: {listing_id}")
 
 
-def send_email_notification(listing: dict) -> bool:
+def send_email_notification(listing: Dict) -> bool:
     """
     Send an email notification for a new listing.
 
@@ -83,9 +87,8 @@ def send_email_notification(listing: dict) -> bool:
                 <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
                     <p style="margin: 10px 0;"><strong>Price:</strong> <span style="color: #27ae60; font-size: 18px;">€{listing['price']}/month</span></p>
                     <p style="margin: 10px 0;"><strong>Address:</strong> {listing['address']}</p>
-                    <p style="margin: 10px 0;"><strong>Available:</strong> {listing['availability']}</p>
-                    {f"<p style='margin: 10px 0;'><strong>Property Type:</strong> {listing['property_type']}</p>" if listing.get('property_type') else ""}
-                    {f"<p style='margin: 10px 0;'><strong>Bedrooms:</strong> {listing['bedrooms']}</p>" if listing.get('bedrooms') else ""}
+                    {f"<p style='margin: 10px 0;'><strong>Title:</strong> {listing.get('title', '')}</p>" if listing.get('title') else ""}
+                    {f"<p style='margin: 10px 0;'><strong>Bedrooms:</strong> {listing.get('bedrooms', 'N/A')}</p>" if listing.get('bedrooms') else ""}
                 </div>
 
                 <div style="margin: 30px 0;">
@@ -124,9 +127,30 @@ def send_email_notification(listing: dict) -> bool:
         return False
 
 
-def search_daft_listings() -> List[dict]:
+def extract_listing_id(url: str) -> Optional[str]:
+    """Extract listing ID from Daft.ie URL."""
+    # Daft URLs typically look like: https://www.daft.ie/for-rent/...-12345
+    match = re.search(r'-(\d+)/?$', url)
+    if match:
+        return match.group(1)
+    return url  # Fallback to full URL if we can't extract ID
+
+
+def parse_price(price_text: str) -> Optional[int]:
+    """Extract numeric price from price text."""
+    if not price_text:
+        return None
+
+    # Remove everything except digits
+    numbers = re.findall(r'\d+', price_text.replace(',', ''))
+    if numbers:
+        return int(numbers[0])
+    return None
+
+
+def search_daft_listings() -> List[Dict]:
     """
-    Search Daft.ie for rooms matching our criteria.
+    Search Daft.ie for rooms matching our criteria using web scraping.
 
     Returns:
         List of listing dictionaries
@@ -134,50 +158,100 @@ def search_daft_listings() -> List[dict]:
     logger.info("Starting Daft.ie search...")
 
     try:
-        daft = Daft()
+        # Build search URL
+        url = DAFT_SEARCH_URL.format(min_price=PRICE_MIN, max_price=PRICE_MAX)
 
-        # Set search parameters
-        daft.set_search_type(SearchType.SHARING)  # Rooms/sharing
-        daft.set_location(Location.DUBLIN_CITY)
-        daft.set_min_price(PRICE_MIN)
-        daft.set_max_price(PRICE_MAX)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
 
-        # Set available date (immediately or from Feb 9th)
-        target_date = datetime(2025, 2, 9)
-        now = datetime.now()
+        logger.info(f"Fetching: {url}")
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
 
-        # If we're before Feb 9th, search for listings available now or by Feb 9th
-        if now < target_date:
-            daft.set_availability_from(now)
+        soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Additional filters for Dublin areas (D6, D7, D8)
-        # Note: daftlistings library handles Dublin City which includes these areas
+        # Find all listing cards
+        # Daft uses different class names, let's try multiple selectors
+        listing_cards = soup.find_all('div', {'data-testid': 'result'})
 
-        # Execute search
-        listings = daft.search()
+        if not listing_cards:
+            # Try alternative selectors
+            listing_cards = soup.find_all('a', href=re.compile(r'/for-rent/'))
+            logger.info(f"Found {len(listing_cards)} listing links (alternative selector)")
 
-        logger.info(f"Found {len(listings)} total listings")
+        logger.info(f"Found {len(listing_cards)} total listings on page")
 
-        # Extract relevant information
         results = []
-        for listing in listings:
+        for card in listing_cards:
             try:
+                # Extract link
+                link_elem = card if card.name == 'a' else card.find('a', href=re.compile(r'/for-rent/'))
+                if not link_elem:
+                    continue
+
+                link = link_elem.get('href', '')
+                if not link.startswith('http'):
+                    link = f"https://www.daft.ie{link}"
+
+                # Extract listing ID
+                listing_id = extract_listing_id(link)
+
+                # Extract price
+                price_elem = card.find('span', {'data-testid': 'price'})
+                if not price_elem:
+                    price_elem = card.find(string=re.compile(r'€\s*\d'))
+
+                price_text = price_elem.get_text(strip=True) if price_elem else 'N/A'
+                price_numeric = parse_price(price_text)
+
+                # Filter by price range
+                if price_numeric and (price_numeric < PRICE_MIN or price_numeric > PRICE_MAX):
+                    continue
+
+                # Extract title/address
+                title_elem = card.find('h2') or card.find('h3') or card.find('p')
+                title = title_elem.get_text(strip=True) if title_elem else 'No title'
+
+                # Extract address (usually in a different element)
+                address_elem = card.find('p', {'data-testid': 'address'})
+                if not address_elem:
+                    address_elem = card.find('p', string=re.compile(r'Dublin'))
+
+                address = address_elem.get_text(strip=True) if address_elem else title
+
+                # Extract bedrooms if available
+                beds_elem = card.find(string=re.compile(r'bed', re.IGNORECASE))
+                bedrooms = beds_elem.strip() if beds_elem else None
+
                 listing_data = {
-                    'id': str(listing.id) if listing.id else str(listing.daft_link),
-                    'price': listing.price if hasattr(listing, 'price') else 'N/A',
-                    'address': listing.formalised_address or listing.title or 'Address not available',
-                    'link': listing.daft_link,
-                    'availability': listing.upcoming_viewing or 'Available now',
-                    'property_type': getattr(listing, 'dwelling_type', None),
-                    'bedrooms': getattr(listing, 'bedrooms', None)
+                    'id': listing_id,
+                    'price': price_text,
+                    'price_numeric': price_numeric,
+                    'address': address,
+                    'title': title,
+                    'link': link,
+                    'bedrooms': bedrooms
                 }
+
                 results.append(listing_data)
+                logger.debug(f"Parsed listing: {address} - {price_text}")
+
             except Exception as e:
-                logger.warning(f"Error processing listing: {str(e)}")
+                logger.warning(f"Error processing listing card: {str(e)}")
                 continue
 
+        logger.info(f"Successfully parsed {len(results)} listings")
         return results
 
+    except requests.RequestException as e:
+        logger.error(f"Error fetching Daft.ie: {str(e)}")
+        return []
     except Exception as e:
         logger.error(f"Error searching Daft.ie: {str(e)}")
         return []
