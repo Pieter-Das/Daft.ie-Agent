@@ -1,7 +1,7 @@
 """
 Daft.ie Room Hunter Bot
 Scans Daft.ie for available rooms in Dublin and sends email notifications.
-Uses Selenium with Chrome to bypass Cloudflare protection.
+Uses Zyte API to bypass Cloudflare protection.
 """
 
 import os
@@ -14,15 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Set, List, Dict
 import logging
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
+import requests
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -37,6 +30,7 @@ PRICE_MAX = 1700
 SEEN_LISTINGS_FILE = "seen_listings.txt"
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
+ZYTE_API_KEY = os.environ.get("ZYTE_API_KEY")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -135,49 +129,56 @@ def send_email_notification(listing: Dict) -> bool:
         return False
 
 
-def setup_driver():
-    """Set up Chrome driver with appropriate options."""
-    chrome_options = Options()
-    chrome_options.add_argument('--headless=new')  # Use new headless mode
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_argument('--window-size=1920,1080')
-    chrome_options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-    chrome_options.add_argument('--disable-web-security')
-    chrome_options.add_argument('--allow-running-insecure-content')
-    chrome_options.add_argument('--disable-features=VizDisplayCompositor')
-    chrome_options.add_argument('--disable-setuid-sandbox')
+def fetch_page_with_zyte(url: str) -> str:
+    """
+    Fetch webpage content using Zyte API.
 
-    # Add page load timeout
-    chrome_options.page_load_strategy = 'eager'  # Don't wait for all resources
+    Args:
+        url: The URL to fetch
 
-    # Disable automation flags
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_experimental_option('prefs', {
-        'profile.default_content_setting_values.notifications': 2,
-        'profile.managed_default_content_settings.images': 2  # Don't load images for speed
-    })
+    Returns:
+        str: HTML content of the page
+    """
+    if not ZYTE_API_KEY:
+        logger.error("ZYTE_API_KEY not found in environment variables!")
+        raise ValueError("ZYTE_API_KEY is required")
+
+    zyte_url = "https://api.zyte.com/v1/extract"
+
+    payload = {
+        "url": url,
+        "browserHtml": True,
+        "javascript": True,
+        "httpResponseBody": True
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
 
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        logger.info(f"Fetching page with Zyte API: {url}")
+        response = requests.post(
+            zyte_url,
+            json=payload,
+            auth=(ZYTE_API_KEY, ''),
+            headers=headers,
+            timeout=60
+        )
+        response.raise_for_status()
 
-        # Set page load and script timeouts
-        driver.set_page_load_timeout(60)  # 60 seconds max for page load
-        driver.set_script_timeout(30)
+        result = response.json()
+        html_content = result.get('browserHtml', '')
 
-        # Execute CDP commands to hide webdriver
-        driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        if not html_content:
+            logger.warning("No browserHtml in response, trying httpResponseBody")
+            html_content = result.get('httpResponseBody', '')
 
-        return driver
-    except Exception as e:
-        logger.error(f"Failed to setup Chrome driver: {str(e)}")
+        logger.info(f"Successfully fetched page ({len(html_content)} characters)")
+        return html_content
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Zyte API request failed: {str(e)}")
         raise
 
 
@@ -199,67 +200,40 @@ def parse_price(price_text: str) -> str:
 
 def search_daft_listings() -> List[Dict]:
     """
-    Search Daft.ie for rooms matching our criteria using Selenium.
+    Search Daft.ie for rooms matching our criteria using Zyte API.
 
     Returns:
         List of listing dictionaries
     """
-    logger.info("Starting Daft.ie search with Selenium...")
-    driver = None
+    logger.info("Starting Daft.ie search with Zyte API...")
 
     try:
-        # Set up Chrome driver
-        driver = setup_driver()
-
         # Build search URL
         url = DAFT_SEARCH_URL.format(min_price=PRICE_MIN, max_price=PRICE_MAX)
-        logger.info(f"Navigating to: {url}")
+        logger.info(f"Searching: {url}")
 
-        # Navigate to page
-        driver.get(url)
+        # Fetch page content with Zyte API
+        html_content = fetch_page_with_zyte(url)
 
-        # Wait for Cloudflare check (if any)
-        time.sleep(5)
-
-        # Check if we're on Cloudflare page
-        if "checking your browser" in driver.page_source.lower() or "cloudflare" in driver.page_source.lower():
-            logger.warning("Cloudflare challenge detected, waiting longer...")
-            time.sleep(10)
-
-        # Wait for listings to load
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='results']"))
-            )
-            logger.info("Page loaded successfully")
-        except TimeoutException:
-            logger.warning("Timeout waiting for listings, trying to parse anyway...")
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
 
         # Check page title for debugging
-        page_title = driver.title
-        logger.info(f"Page title: {page_title}")
-
-        # Save page source for debugging if needed
-        page_source = driver.page_source
-        logger.info(f"Page source length: {len(page_source)} characters")
+        page_title = soup.find('title')
+        logger.info(f"Page title: {page_title.text if page_title else 'N/A'}")
 
         # Check if we see "no results" message
-        if "no results" in page_source.lower() or "0 results" in page_source.lower():
+        if "no results" in html_content.lower() or "0 results" in html_content.lower():
             logger.info("Page explicitly states no results found")
 
-        # Find all listing cards
-        listing_cards = driver.find_elements(By.CSS_SELECTOR, "[data-testid='result']")
+        # Find all listing cards - try multiple selectors
+        listing_cards = soup.select("[data-testid='result']")
         logger.info(f"Found {len(listing_cards)} cards with [data-testid='result']")
 
         if not listing_cards:
-            # Try alternative selectors
-            listing_cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/for-rent/']")
-            logger.info(f"Alternative selector 1: found {len(listing_cards)} links")
-
-        if not listing_cards:
-            # Try even more generic selector
-            listing_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid*='listing'], div[class*='SearchPage'], li[data-testid='result']")
-            logger.info(f"Alternative selector 2: found {len(listing_cards)} elements")
+            # Try alternative selector
+            listing_cards = soup.select("a[href*='/for-rent/']")
+            logger.info(f"Alternative selector: found {len(listing_cards)} links")
 
         logger.info(f"Found {len(listing_cards)} total listing cards to process")
 
@@ -267,47 +241,43 @@ def search_daft_listings() -> List[Dict]:
         for card in listing_cards:
             try:
                 # Extract link
-                try:
-                    link_elem = card if card.tag_name == 'a' else card.find_element(By.CSS_SELECTOR, "a[href*='/for-rent/']")
-                    link = link_elem.get_attribute('href')
-                except NoSuchElementException:
+                if card.name == 'a':
+                    link = card.get('href', '')
+                else:
+                    link_elem = card.select_one("a[href*='/for-rent/']")
+                    link = link_elem.get('href', '') if link_elem else ''
+
+                if not link:
                     continue
 
-                if not link or 'daft.ie' not in link:
+                # Make absolute URL if needed
+                if link.startswith('/'):
+                    link = f"https://www.daft.ie{link}"
+
+                if 'daft.ie' not in link:
                     continue
 
                 # Extract listing ID
                 listing_id = extract_listing_id(link)
 
                 # Extract price
-                try:
-                    price_elem = card.find_element(By.CSS_SELECTOR, "[data-testid='price']")
-                    price_text = price_elem.text
-                except NoSuchElementException:
-                    try:
-                        price_text = card.find_element(By.XPATH, ".//*[contains(text(), '€')]").text
-                    except:
-                        price_text = 'N/A'
+                price_elem = card.select_one("[data-testid='price']")
+                if price_elem:
+                    price_text = price_elem.get_text(strip=True)
+                else:
+                    # Try to find any element containing €
+                    price_elem = card.find(string=re.compile('€'))
+                    price_text = price_elem if price_elem else 'N/A'
 
                 price = parse_price(price_text)
 
-                # Extract title/address
-                try:
-                    title_elem = card.find_element(By.TAG_NAME, "h2")
-                    title = title_elem.text.strip()
-                except NoSuchElementException:
-                    try:
-                        title_elem = card.find_element(By.TAG_NAME, "h3")
-                        title = title_elem.text.strip()
-                    except:
-                        title = "No title"
+                # Extract title
+                title_elem = card.find('h2') or card.find('h3')
+                title = title_elem.get_text(strip=True) if title_elem else "No title"
 
                 # Extract address
-                try:
-                    address_elem = card.find_element(By.CSS_SELECTOR, "[data-testid='address']")
-                    address = address_elem.text.strip()
-                except NoSuchElementException:
-                    address = title
+                address_elem = card.select_one("[data-testid='address']")
+                address = address_elem.get_text(strip=True) if address_elem else title
 
                 listing_data = {
                     'id': listing_id,
@@ -328,19 +298,14 @@ def search_daft_listings() -> List[Dict]:
         return results
 
     except Exception as e:
-        logger.error(f"Error during Selenium scraping: {str(e)}")
+        logger.error(f"Error during Zyte scraping: {str(e)}")
         return []
-
-    finally:
-        if driver:
-            driver.quit()
-            logger.info("Chrome driver closed")
 
 
 def main():
     """Main execution function."""
     logger.info("=" * 60)
-    logger.info("Room Hunter Bot Started (Selenium Mode)")
+    logger.info("Room Hunter Bot Started (Zyte API Mode)")
     logger.info(f"Search criteria: €{PRICE_MIN}-€{PRICE_MAX}, Dublin City (D6, D7, D8)")
     logger.info("=" * 60)
 
