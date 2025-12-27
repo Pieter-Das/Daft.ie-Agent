@@ -1,0 +1,57 @@
+name: Room Hunter Bot
+
+on:
+  schedule:
+    # Run every 15 minutes
+    - cron: '*/15 * * * *'
+
+  # Allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Required to commit back to repository
+
+jobs:
+  scan-daft:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Room Hunter script
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: |
+          python main.py
+
+      - name: Commit and push changes
+        run: |
+          # Configure git
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "Room Hunter Bot"
+
+          # Check if seen_listings.txt has changes
+          if [[ -n $(git status --porcelain seen_listings.txt) ]]; then
+            echo "New listings were processed. Committing changes..."
+            git add seen_listings.txt
+            git commit -m "Update seen listings [skip ci]"
+            git push
+            echo "Changes pushed successfully."
+          else
+            echo "No new listings to commit."
+          fi
