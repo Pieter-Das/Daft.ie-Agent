@@ -1,19 +1,18 @@
 """
 Daft.ie Room Hunter Bot
 Scans Daft.ie for available rooms in Dublin and sends email notifications.
+Uses Daft.ie's internal API for reliable scraping.
 """
 
 import os
 import smtplib
-import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
-from typing import Set, List, Dict, Optional
+from typing import Set, List, Dict
 import logging
 import requests
-from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(
@@ -31,8 +30,8 @@ EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 SMTP_SERVER = "smtp-mail.outlook.com"
 SMTP_PORT = 587
 
-# Daft.ie search URL for sharing in Dublin
-DAFT_SEARCH_URL = "https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from={min_price}&rentalPrice_to={max_price}&propertyType=share"
+# Daft.ie API endpoint
+DAFT_API_URL = "https://gateway.daft.ie/old/v1/listings"
 
 
 def load_seen_listings() -> Set[str]:
@@ -127,122 +126,74 @@ def send_email_notification(listing: Dict) -> bool:
         return False
 
 
-def extract_listing_id(url: str) -> Optional[str]:
-    """Extract listing ID from Daft.ie URL."""
-    # Daft URLs typically look like: https://www.daft.ie/for-rent/...-12345
-    match = re.search(r'-(\d+)/?$', url)
-    if match:
-        return match.group(1)
-    return url  # Fallback to full URL if we can't extract ID
-
-
-def parse_price(price_text: str) -> Optional[int]:
-    """Extract numeric price from price text."""
-    if not price_text:
-        return None
-
-    # Remove everything except digits
-    numbers = re.findall(r'\d+', price_text.replace(',', ''))
-    if numbers:
-        return int(numbers[0])
-    return None
-
-
 def search_daft_listings() -> List[Dict]:
     """
-    Search Daft.ie for rooms matching our criteria using web scraping.
+    Search Daft.ie for rooms matching our criteria using their API.
 
     Returns:
         List of listing dictionaries
     """
-    logger.info("Starting Daft.ie search...")
+    logger.info("Starting Daft.ie search via API...")
 
     try:
-        # Build search URL
-        url = DAFT_SEARCH_URL.format(min_price=PRICE_MIN, max_price=PRICE_MAX)
-
-        # Create a session with realistic browser headers
-        session = requests.Session()
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-IE,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-            'Referer': 'https://www.daft.ie/'
+        # Build API request parameters
+        params = {
+            "section": "sharing",
+            "location": "dublin-city",
+            "minPrice": PRICE_MIN,
+            "maxPrice": PRICE_MAX,
+            "pageSize": 50,
+            "from": 0,
+            "sort": "publishDateDesc"
         }
 
-        logger.info(f"Fetching: {url}")
-        response = session.get(url, headers=headers, timeout=30, allow_redirects=True)
-        response.raise_for_status()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'platform': 'web'
+        }
 
-        soup = BeautifulSoup(response.content, 'html.parser')
+        logger.info(f"Fetching from Daft API: {DAFT_API_URL}")
+        logger.info(f"Search params: €{PRICE_MIN}-€{PRICE_MAX}, Dublin City, Sharing")
 
-        # Find all listing cards
-        # Daft uses different class names, let's try multiple selectors
-        listing_cards = soup.find_all('div', {'data-testid': 'result'})
+        response = requests.get(DAFT_API_URL, params=params, headers=headers, timeout=30)
 
-        if not listing_cards:
-            # Try alternative selectors
-            listing_cards = soup.find_all('a', href=re.compile(r'/for-rent/'))
-            logger.info(f"Found {len(listing_cards)} listing links (alternative selector)")
+        # If API fails, try alternative approach
+        if response.status_code != 200:
+            logger.warning(f"API returned status {response.status_code}, using fallback method")
+            return search_daft_fallback()
 
-        logger.info(f"Found {len(listing_cards)} total listings on page")
+        data = response.json()
+
+        if 'listings' not in data:
+            logger.warning("No 'listings' key in API response")
+            return []
+
+        listings = data['listings']
+        logger.info(f"Found {len(listings)} total listings from API")
 
         results = []
-        for card in listing_cards:
+        for listing in listings:
             try:
-                # Extract link
-                link_elem = card if card.name == 'a' else card.find('a', href=re.compile(r'/for-rent/'))
-                if not link_elem:
+                listing_id = str(listing.get('id', ''))
+                if not listing_id:
                     continue
 
-                link = link_elem.get('href', '')
-                if not link.startswith('http'):
-                    link = f"https://www.daft.ie{link}"
+                price = listing.get('price', 'N/A')
+                title = listing.get('title', 'No title')
+                address = listing.get('abbreviatedAddress') or listing.get('address', title)
 
-                # Extract listing ID
-                listing_id = extract_listing_id(link)
+                # Get number of bedrooms
+                bedrooms = listing.get('numBedrooms', listing.get('bedrooms'))
 
-                # Extract price
-                price_elem = card.find('span', {'data-testid': 'price'})
-                if not price_elem:
-                    price_elem = card.find(string=re.compile(r'€\s*\d'))
-
-                price_text = price_elem.get_text(strip=True) if price_elem else 'N/A'
-                price_numeric = parse_price(price_text)
-
-                # Filter by price range
-                if price_numeric and (price_numeric < PRICE_MIN or price_numeric > PRICE_MAX):
-                    continue
-
-                # Extract title/address
-                title_elem = card.find('h2') or card.find('h3') or card.find('p')
-                title = title_elem.get_text(strip=True) if title_elem else 'No title'
-
-                # Extract address (usually in a different element)
-                address_elem = card.find('p', {'data-testid': 'address'})
-                if not address_elem:
-                    address_elem = card.find('p', string=re.compile(r'Dublin'))
-
-                address = address_elem.get_text(strip=True) if address_elem else title
-
-                # Extract bedrooms if available
-                beds_elem = card.find(string=re.compile(r'bed', re.IGNORECASE))
-                bedrooms = beds_elem.strip() if beds_elem else None
+                # Build Daft.ie URL
+                seo_friendly_path = listing.get('seoFriendlyPath', '')
+                link = f"https://www.daft.ie{seo_friendly_path}" if seo_friendly_path else f"https://www.daft.ie/for-rent/{listing_id}"
 
                 listing_data = {
                     'id': listing_id,
-                    'price': price_text,
-                    'price_numeric': price_numeric,
+                    'price': price,
                     'address': address,
                     'title': title,
                     'link': link,
@@ -250,21 +201,31 @@ def search_daft_listings() -> List[Dict]:
                 }
 
                 results.append(listing_data)
-                logger.debug(f"Parsed listing: {address} - {price_text}")
+                logger.debug(f"Parsed listing: {address} - €{price}")
 
             except Exception as e:
-                logger.warning(f"Error processing listing card: {str(e)}")
+                logger.warning(f"Error processing listing: {str(e)}")
                 continue
 
         logger.info(f"Successfully parsed {len(results)} listings")
         return results
 
     except requests.RequestException as e:
-        logger.error(f"Error fetching Daft.ie: {str(e)}")
-        return []
+        logger.error(f"Error fetching Daft.ie API: {str(e)}")
+        return search_daft_fallback()
     except Exception as e:
         logger.error(f"Error searching Daft.ie: {str(e)}")
         return []
+
+
+def search_daft_fallback() -> List[Dict]:
+    """
+    Fallback method: Return empty list and log for manual checking.
+    In production, you could implement email notification to manually check Daft.ie.
+    """
+    logger.warning("Fallback: Unable to fetch listings automatically")
+    logger.info("Please check Daft.ie manually: https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from=1000&rentalPrice_to=1700&propertyType=share")
+    return []
 
 
 def main():
