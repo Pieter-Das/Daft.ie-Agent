@@ -34,8 +34,8 @@ ZYTE_API_KEY = os.environ.get("ZYTE_API_KEY")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-# Daft.ie search URL
-DAFT_SEARCH_URL = "https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from={min_price}&rentalPrice_to={max_price}&propertyType=share"
+# Daft.ie search URL (removed propertyType=share as there are currently no share listings)
+DAFT_SEARCH_URL = "https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from={min_price}&rentalPrice_to={max_price}"
 
 
 def load_seen_listings() -> Set[str]:
@@ -147,13 +147,7 @@ def fetch_page_with_zyte(url: str) -> str:
 
     payload = {
         "url": url,
-        "browserHtml": True,
-        "javascript": True,
-        "httpResponseBody": True
-    }
-
-    headers = {
-        "Content-Type": "application/json"
+        "browserHtml": True
     }
 
     try:
@@ -162,7 +156,6 @@ def fetch_page_with_zyte(url: str) -> str:
             zyte_url,
             json=payload,
             auth=(ZYTE_API_KEY, ''),
-            headers=headers,
             timeout=60
         )
         response.raise_for_status()
@@ -179,6 +172,8 @@ def fetch_page_with_zyte(url: str) -> str:
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Zyte API request failed: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Response content: {e.response.text}")
         raise
 
 
@@ -226,27 +221,19 @@ def search_daft_listings() -> List[Dict]:
         if "no results" in html_content.lower() or "0 results" in html_content.lower():
             logger.info("Page explicitly states no results found")
 
-        # Find all listing cards - try multiple selectors
-        listing_cards = soup.select("[data-testid='result']")
-        logger.info(f"Found {len(listing_cards)} cards with [data-testid='result']")
-
-        if not listing_cards:
-            # Try alternative selector
-            listing_cards = soup.select("a[href*='/for-rent/']")
-            logger.info(f"Alternative selector: found {len(listing_cards)} links")
-
-        logger.info(f"Found {len(listing_cards)} total listing cards to process")
+        # Find all listing cards using the correct selector
+        listing_cards = soup.select("ul[data-testid='results'] > li")
+        logger.info(f"Found {len(listing_cards)} listing cards")
 
         results = []
         for card in listing_cards:
             try:
-                # Extract link
-                if card.name == 'a':
-                    link = card.get('href', '')
-                else:
-                    link_elem = card.select_one("a[href*='/for-rent/']")
-                    link = link_elem.get('href', '') if link_elem else ''
+                # Extract link - look for main listing link
+                link_elem = card.select_one("a")
+                if not link_elem:
+                    continue
 
+                link = link_elem.get('href', '')
                 if not link:
                     continue
 
@@ -254,30 +241,46 @@ def search_daft_listings() -> List[Dict]:
                 if link.startswith('/'):
                     link = f"https://www.daft.ie{link}"
 
-                if 'daft.ie' not in link:
+                # Skip non-listing links (ads, etc.)
+                if '/for-rent/' not in link and '/sharing/' not in link:
                     continue
 
                 # Extract listing ID
                 listing_id = extract_listing_id(link)
 
-                # Extract price
-                price_elem = card.select_one("[data-testid='price']")
+                # Extract price - look in subunit-card-container or find € sign
+                price_elem = card.select_one("[data-testid='subunit-card-container']")
                 if price_elem:
-                    price_text = price_elem.get_text(strip=True)
+                    # Find first occurrence of € price
+                    price_match = price_elem.find(string=re.compile(r'€[\d,]+'))
+                    price_text = price_match.strip() if price_match else 'N/A'
                 else:
-                    # Try to find any element containing €
-                    price_elem = card.find(string=re.compile('€'))
-                    price_text = price_elem if price_elem else 'N/A'
+                    # Fallback: try data-testid='price'
+                    price_elem = card.select_one("[data-testid='price']")
+                    if price_elem:
+                        price_text = price_elem.get_text(strip=True)
+                    else:
+                        # Last resort: find any € sign
+                        price_match = card.find(string=re.compile(r'€[\d,]+'))
+                        price_text = price_match.strip() if price_match else 'N/A'
 
                 price = parse_price(price_text)
 
-                # Extract title
-                title_elem = card.find('h2') or card.find('h3')
-                title = title_elem.get_text(strip=True) if title_elem else "No title"
-
-                # Extract address
-                address_elem = card.select_one("[data-testid='address']")
-                address = address_elem.get_text(strip=True) if address_elem else title
+                # Extract title and address from card-container
+                card_container = card.select_one("[data-testid='card-container']")
+                if card_container:
+                    # The card-container text contains: "TH EnquiriesCoolevally, Shankill, Dublin 18 , Shan..."
+                    # We need to extract the address part
+                    container_text = card_container.get_text(strip=True)
+                    # Remove "TH Enquiries" prefix if present
+                    container_text = container_text.replace('TH Enquiries', '').strip()
+                    title = container_text if container_text else "No title"
+                    address = title
+                else:
+                    # Fallback to headings
+                    title_elem = card.find('h2') or card.find('h3') or card.find('h1')
+                    title = title_elem.get_text(strip=True) if title_elem else "No title"
+                    address = title
 
                 listing_data = {
                     'id': listing_id,
