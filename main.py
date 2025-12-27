@@ -27,7 +27,7 @@ PRICE_MAX = 1700
 SEEN_LISTINGS_FILE = "seen_listings.txt"
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
-SMTP_SERVER = "smtp-mail.outlook.com"
+SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 
