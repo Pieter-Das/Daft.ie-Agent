@@ -206,6 +206,11 @@ def search_daft_listings() -> List[Dict]:
         # Wait for Cloudflare check (if any)
         time.sleep(5)
 
+        # Check if we're on Cloudflare page
+        if "checking your browser" in driver.page_source.lower() or "cloudflare" in driver.page_source.lower():
+            logger.warning("Cloudflare challenge detected, waiting longer...")
+            time.sleep(10)
+
         # Wait for listings to load
         try:
             WebDriverWait(driver, 20).until(
@@ -215,9 +220,17 @@ def search_daft_listings() -> List[Dict]:
         except TimeoutException:
             logger.warning("Timeout waiting for listings, trying to parse anyway...")
 
+        # Check page title for debugging
+        page_title = driver.title
+        logger.info(f"Page title: {page_title}")
+
         # Save page source for debugging if needed
         page_source = driver.page_source
-        logger.debug(f"Page source length: {len(page_source)}")
+        logger.info(f"Page source length: {len(page_source)} characters")
+
+        # Check if we see "no results" message
+        if "no results" in page_source.lower() or "0 results" in page_source.lower():
+            logger.info("Page explicitly states no results found")
 
         # Find all listing cards
         listing_cards = driver.find_elements(By.CSS_SELECTOR, "[data-testid='result']")
