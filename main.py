@@ -40,6 +40,14 @@ ALLOWED_AREAS = ['dublin 6', 'dublin-6', 'dublin 6w', 'dublin-6w', 'dublin 7', '
 # Daft.ie search URL - Sharing in D6, D6W, D7, D8, posted in last 3 days
 DAFT_SEARCH_URL = "https://www.daft.ie/sharing/ireland?location=dublin-7-dublin&location=dublin-6-dublin&location=dublin-6w-dublin&location=dublin-8-dublin&rentalPrice_from={min_price}&rentalPrice_to={max_price}&firstPublishDate_from=now-3d/d"
 
+# MyHome.ie search URLs for each area
+MYHOME_SEARCH_URLS = [
+    "https://www.myhome.ie/rentals/dublin/property-to-rent-in-dublin-7?minprice={min_price}&maxprice={max_price}",
+    "https://www.myhome.ie/rentals/dublin-6/property-to-rent?minprice={min_price}&maxprice={max_price}",
+    "https://www.myhome.ie/rentals/dublin-8/property-to-rent?minprice={min_price}&maxprice={max_price}",
+    "https://www.myhome.ie/rentals/dublin-6w/property-to-rent?minprice={min_price}&maxprice={max_price}",
+]
+
 
 def load_seen_listings() -> Set[str]:
     """Load the set of previously seen listing IDs from file."""
@@ -331,20 +339,134 @@ def search_daft_listings() -> List[Dict]:
         return []
 
 
+def search_myhome_listings() -> List[Dict]:
+    """
+    Search MyHome.ie for properties matching our criteria using Zyte API.
+
+    Returns:
+        List of listing dictionaries
+    """
+    logger.info("Starting MyHome.ie search with Zyte API...")
+    all_results = []
+
+    for url_template in MYHOME_SEARCH_URLS:
+        try:
+            # Build search URL
+            url = url_template.format(min_price=PRICE_MIN, max_price=PRICE_MAX)
+            logger.info(f"Searching MyHome.ie: {url}")
+
+            # Fetch page content with Zyte API
+            html_content = fetch_page_with_zyte(url)
+
+            # Parse HTML with BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            # Find all property cards
+            listing_cards = soup.select('div.property-card')
+            logger.info(f"Found {len(listing_cards)} MyHome.ie listing cards")
+
+            for card in listing_cards:
+                try:
+                    # Extract link
+                    link_elem = card.select_one('a')
+                    if not link_elem:
+                        continue
+
+                    link = link_elem.get('href', '')
+                    if not link:
+                        continue
+
+                    # Make absolute URL
+                    if link.startswith('/'):
+                        link = f"https://www.myhome.ie{link}"
+
+                    # Extract listing ID from URL
+                    listing_id = extract_listing_id(link)
+
+                    # Check if listing is in allowed areas
+                    link_lower = link.lower()
+                    is_allowed_area = False
+
+                    for area in ALLOWED_AREAS:
+                        if area in link_lower:
+                            is_allowed_area = True
+                            break
+
+                    # Extract address
+                    address_elem = card.select_one('.card-text')
+                    if address_elem:
+                        address = address_elem.get_text(strip=True)
+                    else:
+                        address = "No address"
+
+                    # Double-check area in address
+                    address_lower = address.lower()
+                    if not is_allowed_area:
+                        for area in ALLOWED_AREAS:
+                            if area in address_lower:
+                                is_allowed_area = True
+                                break
+
+                    # Skip if not in allowed areas
+                    if not is_allowed_area:
+                        logger.debug(f"Skipping MyHome listing outside allowed areas: {address}")
+                        continue
+
+                    # Extract price
+                    price_match = card.find(string=re.compile(r'€[\d,]+'))
+                    price_text = price_match.strip() if price_match else 'N/A'
+                    price = parse_price(price_text)
+
+                    # Use address as title
+                    title = address
+
+                    listing_data = {
+                        'id': f"myhome_{listing_id}",  # Prefix to avoid conflicts with Daft IDs
+                        'price': price,
+                        'address': address,
+                        'title': title,
+                        'link': link
+                    }
+
+                    all_results.append(listing_data)
+                    logger.debug(f"Parsed MyHome listing: {address} - {price}")
+
+                except Exception as e:
+                    logger.warning(f"Error processing MyHome listing card: {str(e)}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error scraping MyHome.ie URL {url_template}: {str(e)}")
+            continue
+
+    logger.info(f"Successfully parsed {len(all_results)} MyHome.ie listings")
+    return all_results
+
+
 def main():
     """Main execution function."""
     logger.info("=" * 60)
     logger.info("Room Hunter Bot Started (Zyte API Mode)")
-    logger.info(f"Search criteria: Sharing, €{PRICE_MIN}-€{PRICE_MAX}, D6/D6W/D7/D8, Last 3 days")
+    logger.info(f"Search criteria: €{PRICE_MIN}-€{PRICE_MAX}, D6/D6W/D7/D8")
+    logger.info("Sources: Daft.ie (Sharing, last 3 days) + MyHome.ie (All rentals)")
     logger.info("=" * 60)
 
     # Load previously seen listings
     seen_listings = load_seen_listings()
 
-    # Search for new listings
-    listings = search_daft_listings()
+    # Search both websites
+    logger.info("\n🔍 Searching Daft.ie...")
+    daft_listings = search_daft_listings()
 
-    if not listings:
+    logger.info("\n🔍 Searching MyHome.ie...")
+    myhome_listings = search_myhome_listings()
+
+    # Combine all listings
+    all_listings = daft_listings + myhome_listings
+
+    logger.info(f"\n📊 Total listings: {len(daft_listings)} from Daft + {len(myhome_listings)} from MyHome = {len(all_listings)} total")
+
+    if not all_listings:
         logger.info("No listings found matching criteria.")
         return
 
@@ -352,7 +474,7 @@ def main():
     new_listings_count = 0
     email_sent_count = 0
 
-    for listing in listings:
+    for listing in all_listings:
         listing_id = listing['id']
 
         if listing_id in seen_listings:
@@ -360,7 +482,8 @@ def main():
             continue
 
         new_listings_count += 1
-        logger.info(f"New listing found: {listing['address']} - {listing['price']}")
+        source = "Daft.ie" if not listing_id.startswith("myhome_") else "MyHome.ie"
+        logger.info(f"✨ New listing found [{source}]: {listing['address']} - {listing['price']}")
 
         # Send email notification
         if send_email_notification(listing):
@@ -373,7 +496,7 @@ def main():
 
     # Summary
     logger.info("=" * 60)
-    logger.info(f"Scan complete: {len(listings)} total, {new_listings_count} new, {email_sent_count} notified")
+    logger.info(f"✅ Scan complete: {len(all_listings)} total, {new_listings_count} new, {email_sent_count} notified")
     logger.info("=" * 60)
 
 
