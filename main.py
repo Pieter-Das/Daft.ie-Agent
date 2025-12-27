@@ -215,15 +215,25 @@ def search_daft_listings() -> List[Dict]:
         except TimeoutException:
             logger.warning("Timeout waiting for listings, trying to parse anyway...")
 
+        # Save page source for debugging if needed
+        page_source = driver.page_source
+        logger.debug(f"Page source length: {len(page_source)}")
+
         # Find all listing cards
         listing_cards = driver.find_elements(By.CSS_SELECTOR, "[data-testid='result']")
+        logger.info(f"Found {len(listing_cards)} cards with [data-testid='result']")
 
         if not listing_cards:
-            # Try alternative selector
+            # Try alternative selectors
             listing_cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/for-rent/']")
-            logger.info(f"Using alternative selector, found {len(listing_cards)} elements")
+            logger.info(f"Alternative selector 1: found {len(listing_cards)} links")
 
-        logger.info(f"Found {len(listing_cards)} total listing cards")
+        if not listing_cards:
+            # Try even more generic selector
+            listing_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid*='listing'], div[class*='SearchPage'], li[data-testid='result']")
+            logger.info(f"Alternative selector 2: found {len(listing_cards)} elements")
+
+        logger.info(f"Found {len(listing_cards)} total listing cards to process")
 
         results = []
         for card in listing_cards:
