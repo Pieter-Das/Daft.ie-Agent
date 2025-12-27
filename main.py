@@ -1,18 +1,28 @@
 """
 Daft.ie Room Hunter Bot
 Scans Daft.ie for available rooms in Dublin and sends email notifications.
-Uses Daft.ie's internal API for reliable scraping.
+Uses Selenium with Chrome to bypass Cloudflare protection.
 """
 
 import os
 import smtplib
+import re
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
 from typing import Set, List, Dict
 import logging
-import requests
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 
 # Configure logging
 logging.basicConfig(
@@ -30,8 +40,8 @@ EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 SMTP_SERVER = "smtp-mail.outlook.com"
 SMTP_PORT = 587
 
-# Daft.ie API endpoint
-DAFT_API_URL = "https://gateway.daft.ie/old/v1/listings"
+# Daft.ie search URL
+DAFT_SEARCH_URL = "https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from={min_price}&rentalPrice_to={max_price}&propertyType=share"
 
 
 def load_seen_listings() -> Set[str]:
@@ -87,7 +97,6 @@ def send_email_notification(listing: Dict) -> bool:
                     <p style="margin: 10px 0;"><strong>Price:</strong> <span style="color: #27ae60; font-size: 18px;">€{listing['price']}/month</span></p>
                     <p style="margin: 10px 0;"><strong>Address:</strong> {listing['address']}</p>
                     {f"<p style='margin: 10px 0;'><strong>Title:</strong> {listing.get('title', '')}</p>" if listing.get('title') else ""}
-                    {f"<p style='margin: 10px 0;'><strong>Bedrooms:</strong> {listing.get('bedrooms', 'N/A')}</p>" if listing.get('bedrooms') else ""}
                 </div>
 
                 <div style="margin: 30px 0;">
@@ -126,112 +135,174 @@ def send_email_notification(listing: Dict) -> bool:
         return False
 
 
+def setup_driver():
+    """Set up Chrome driver with appropriate options."""
+    chrome_options = Options()
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    # Disable automation flags
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        # Execute CDP commands to hide webdriver
+        driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+            "userAgent": 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        return driver
+    except Exception as e:
+        logger.error(f"Failed to setup Chrome driver: {str(e)}")
+        raise
+
+
+def extract_listing_id(url: str) -> str:
+    """Extract listing ID from Daft.ie URL."""
+    match = re.search(r'-(\d+)/?$', url)
+    if match:
+        return match.group(1)
+    return url.split('/')[-1]
+
+
+def parse_price(price_text: str) -> str:
+    """Clean up price text."""
+    if not price_text:
+        return 'N/A'
+    # Remove whitespace and extra characters
+    return price_text.strip().replace('\n', ' ')
+
+
 def search_daft_listings() -> List[Dict]:
     """
-    Search Daft.ie for rooms matching our criteria using their API.
+    Search Daft.ie for rooms matching our criteria using Selenium.
 
     Returns:
         List of listing dictionaries
     """
-    logger.info("Starting Daft.ie search via API...")
+    logger.info("Starting Daft.ie search with Selenium...")
+    driver = None
 
     try:
-        # Build API request parameters
-        params = {
-            "section": "sharing",
-            "location": "dublin-city",
-            "minPrice": PRICE_MIN,
-            "maxPrice": PRICE_MAX,
-            "pageSize": 50,
-            "from": 0,
-            "sort": "publishDateDesc"
-        }
+        # Set up Chrome driver
+        driver = setup_driver()
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'platform': 'web'
-        }
+        # Build search URL
+        url = DAFT_SEARCH_URL.format(min_price=PRICE_MIN, max_price=PRICE_MAX)
+        logger.info(f"Navigating to: {url}")
 
-        logger.info(f"Fetching from Daft API: {DAFT_API_URL}")
-        logger.info(f"Search params: €{PRICE_MIN}-€{PRICE_MAX}, Dublin City, Sharing")
+        # Navigate to page
+        driver.get(url)
 
-        response = requests.get(DAFT_API_URL, params=params, headers=headers, timeout=30)
+        # Wait for Cloudflare check (if any)
+        time.sleep(5)
 
-        # If API fails, try alternative approach
-        if response.status_code != 200:
-            logger.warning(f"API returned status {response.status_code}, using fallback method")
-            return search_daft_fallback()
+        # Wait for listings to load
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='results']"))
+            )
+            logger.info("Page loaded successfully")
+        except TimeoutException:
+            logger.warning("Timeout waiting for listings, trying to parse anyway...")
 
-        data = response.json()
+        # Find all listing cards
+        listing_cards = driver.find_elements(By.CSS_SELECTOR, "[data-testid='result']")
 
-        if 'listings' not in data:
-            logger.warning("No 'listings' key in API response")
-            return []
+        if not listing_cards:
+            # Try alternative selector
+            listing_cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/for-rent/']")
+            logger.info(f"Using alternative selector, found {len(listing_cards)} elements")
 
-        listings = data['listings']
-        logger.info(f"Found {len(listings)} total listings from API")
+        logger.info(f"Found {len(listing_cards)} total listing cards")
 
         results = []
-        for listing in listings:
+        for card in listing_cards:
             try:
-                listing_id = str(listing.get('id', ''))
-                if not listing_id:
+                # Extract link
+                try:
+                    link_elem = card if card.tag_name == 'a' else card.find_element(By.CSS_SELECTOR, "a[href*='/for-rent/']")
+                    link = link_elem.get_attribute('href')
+                except NoSuchElementException:
                     continue
 
-                price = listing.get('price', 'N/A')
-                title = listing.get('title', 'No title')
-                address = listing.get('abbreviatedAddress') or listing.get('address', title)
+                if not link or 'daft.ie' not in link:
+                    continue
 
-                # Get number of bedrooms
-                bedrooms = listing.get('numBedrooms', listing.get('bedrooms'))
+                # Extract listing ID
+                listing_id = extract_listing_id(link)
 
-                # Build Daft.ie URL
-                seo_friendly_path = listing.get('seoFriendlyPath', '')
-                link = f"https://www.daft.ie{seo_friendly_path}" if seo_friendly_path else f"https://www.daft.ie/for-rent/{listing_id}"
+                # Extract price
+                try:
+                    price_elem = card.find_element(By.CSS_SELECTOR, "[data-testid='price']")
+                    price_text = price_elem.text
+                except NoSuchElementException:
+                    try:
+                        price_text = card.find_element(By.XPATH, ".//*[contains(text(), '€')]").text
+                    except:
+                        price_text = 'N/A'
+
+                price = parse_price(price_text)
+
+                # Extract title/address
+                try:
+                    title_elem = card.find_element(By.TAG_NAME, "h2")
+                    title = title_elem.text.strip()
+                except NoSuchElementException:
+                    try:
+                        title_elem = card.find_element(By.TAG_NAME, "h3")
+                        title = title_elem.text.strip()
+                    except:
+                        title = "No title"
+
+                # Extract address
+                try:
+                    address_elem = card.find_element(By.CSS_SELECTOR, "[data-testid='address']")
+                    address = address_elem.text.strip()
+                except NoSuchElementException:
+                    address = title
 
                 listing_data = {
                     'id': listing_id,
                     'price': price,
                     'address': address,
                     'title': title,
-                    'link': link,
-                    'bedrooms': bedrooms
+                    'link': link
                 }
 
                 results.append(listing_data)
-                logger.debug(f"Parsed listing: {address} - €{price}")
+                logger.debug(f"Parsed listing: {address} - {price}")
 
             except Exception as e:
-                logger.warning(f"Error processing listing: {str(e)}")
+                logger.warning(f"Error processing listing card: {str(e)}")
                 continue
 
         logger.info(f"Successfully parsed {len(results)} listings")
         return results
 
-    except requests.RequestException as e:
-        logger.error(f"Error fetching Daft.ie API: {str(e)}")
-        return search_daft_fallback()
     except Exception as e:
-        logger.error(f"Error searching Daft.ie: {str(e)}")
+        logger.error(f"Error during Selenium scraping: {str(e)}")
         return []
 
-
-def search_daft_fallback() -> List[Dict]:
-    """
-    Fallback method: Return empty list and log for manual checking.
-    In production, you could implement email notification to manually check Daft.ie.
-    """
-    logger.warning("Fallback: Unable to fetch listings automatically")
-    logger.info("Please check Daft.ie manually: https://www.daft.ie/property-for-rent/dublin-city?rentalPrice_from=1000&rentalPrice_to=1700&propertyType=share")
-    return []
+    finally:
+        if driver:
+            driver.quit()
+            logger.info("Chrome driver closed")
 
 
 def main():
     """Main execution function."""
     logger.info("=" * 60)
-    logger.info("Room Hunter Bot Started")
+    logger.info("Room Hunter Bot Started (Selenium Mode)")
     logger.info(f"Search criteria: €{PRICE_MIN}-€{PRICE_MAX}, Dublin City (D6, D7, D8)")
     logger.info("=" * 60)
 
@@ -257,7 +328,7 @@ def main():
             continue
 
         new_listings_count += 1
-        logger.info(f"New listing found: {listing['address']} - €{listing['price']}")
+        logger.info(f"New listing found: {listing['address']} - {listing['price']}")
 
         # Send email notification
         if send_email_notification(listing):
